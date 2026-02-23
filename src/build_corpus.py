@@ -3,67 +3,195 @@ import clip
 import nltk
 import os
 from tqdm import tqdm
-from nltk.corpus import brown, stopwords
+from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
-from collections import Counter, defaultdict
+from collections import Counter
 
-# Setup NLTK
-for res in ['punkt', 'brown', 'stopwords', 'wordnet', 'omw-1.4', 'averaged_perceptron_tagger_eng']:
+# Ensure NLTK resources are available
+for res in ['punkt', 'stopwords', 'wordnet', 'averaged_perceptron_tagger']:
     nltk.download(res, quiet=True)
 
 def get_imagenet_vocab(dataset_path):
-    """Extracts cleaned vocab from your specific EEG/ImageNet dataset."""
+    """Correctly extracts and cleans vocab from your flat EEG/Text list."""
+    # Load your new preprocessed list of dicts
     dataset = torch.load(dataset_path, map_location='cpu')
+    print(f"Processing {len(dataset)} captions for vocabulary extraction...")
+
     lemmatizer = WordNetLemmatizer()
     stop_words = set(stopwords.words('english'))
-    word_tag_counts = defaultdict(Counter)
+    
+    # We want to capture distinct semantic nouns and verbs from the captions
+    all_words = []
 
-    for item in dataset:
-        tokens = nltk.word_tokenize(item.get('caption', "").lower())
-        for word, tag in nltk.pos_tag(tokens):
+    for item in tqdm(dataset, desc="Tokenizing Captions"):
+        caption = item.get('caption', "").lower()
+        if not caption: continue
+            
+        # 1. Tokenize and Tag POS (Parts of Speech)
+        tokens = nltk.word_tokenize(caption)
+        tagged = nltk.pos_tag(tokens)
+        
+        for word, tag in tagged:
+            # 2. Filter for significant words (Nouns, Verbs, Adjectives)
+            if word.isalpha() and word not in stop_words and len(word) > 2:
+                # Map NLTK tags to Lemmatizer categories
+                cat = None
+                if tag.startswith('NN'): cat = 'n'   # Noun
+                elif tag.startswith('VB'): cat = 'v' # Verb
+                elif tag.startswith('JJ'): cat = 'a' # Adjective
+                
+                if cat:
+                    lemma = lemmatizer.lemmatize(word, pos=cat)
+                    all_words.append(lemma)
+
+    # 3. Use Counter to get unique words, potentially filtering by frequency if needed
+    vocab = sorted(list(set(all_words)))
+    print(f"Generated a unique vocabulary of {len(vocab)} words.")
+    return vocab
+
+def build_corpus(mode="imagenet", dataset_path=None, output_path="data/corpus.pt"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 1. Gather Vocabulary
+    if mode == "brown":
+        print("Building Brown Corpus...")
+        words = nltk.corpus.brown.words()
+        clean = [w.lower() for w in words if w.isalpha() and w.lower() not in set(stopwords.words('english'))]
+        vocab = [w for w, _ in Counter(clean).most_common(20000)]
+    else:
+        vocab = get_imagenet_vocab(dataset_path)
+
+    # 2. CLIP Encoding (Must use ViT-B/32 to align with Thought2Text/ChannelNet)
+    print(f"Loading CLIP ViT-B/32 on {device}...")
+    model, _ = clip.load("ViT-B/32", device=device)
+    all_embs = []
+    
+    # 3. Batch Encode Vocab into CLIP Text Space
+    print(f"Encoding {len(vocab)} words...")
+    batch_size = 10
+    for i in tqdm(range(0, len(vocab), batch_size)):
+        batch = vocab[i:i+batch_size]
+        tokens = clip.tokenize(batch).to(device)
+        with torch.no_grad():
+            # Get the 512-D text embeddings
+            embs = model.encode_text(tokens)
+            # Normalize for cosine similarity alignment
+            embs /= embs.norm(dim=-1, keepdim=True)
+            # Move to CPU immediately to save GPU memory on your A100
+            embs = embs.cpu()
+
+            # Iterate through the batch and store each as [1, 512]
+            for j in range(embs.size(0)):
+                # Indexing with [j:j+1] keeps the batch dimension [1, 512]
+                all_embs.append(embs[j:j+1])
+
+    final_tensor = torch.stack(all_embs)
+    # 4. Save for use in src/aligner.py
+    final_data = {
+        "words": vocab, 
+        "embeddings": final_tensor # Shape: [Vocab_Size, 512]
+    }
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    torch.save(final_data, output_path)
+    print(f"✅ Corpus successfully saved to {output_path}")
+
+# if __name__ == "__main__":
+#     build_corpus(
+#         mode="imagenet", 
+#         dataset_path="results/channelnet_imagenet_eeg_test_clip_latents.pt",
+#         output_path="results/imagenet_corpus.pt"
+#     )
+
+import torch
+import clip
+import nltk
+import os
+from tqdm import tqdm
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from collections import defaultdict
+
+# Ensure NLTK resources are available
+for res in ['punkt', 'stopwords', 'wordnet', 'averaged_perceptron_tagger']:
+    nltk.download(res, quiet=True)
+
+def extract_subject_vocab(dataset):
+    """Groups vocabulary by subject ID from the preprocessed dataset."""
+    subject_vocabs = defaultdict(list)
+    lemmatizer = WordNetLemmatizer()
+    stop_words = set(stopwords.words('english'))
+    
+    print(f"Extracting subject-specific vocab from {len(dataset)} samples...")
+
+    for item in tqdm(dataset, desc="Processing Subjects"):
+        sub_id = item.get('subject')
+        caption = item.get('caption', "").lower()
+        if not caption: continue
+            
+        tokens = nltk.word_tokenize(caption)
+        tagged = nltk.pos_tag(tokens)
+        
+        for word, tag in tagged:
             if word.isalpha() and word not in stop_words and len(word) > 2:
                 cat = None
                 if tag.startswith('NN'): cat = 'n'
                 elif tag.startswith('VB'): cat = 'v'
                 elif tag.startswith('JJ'): cat = 'a'
-                if cat: word_tag_counts[word][cat] += 1
+                
+                if cat:
+                    lemma = lemmatizer.lemmatize(word, pos=cat)
+                    subject_vocabs[sub_id].append(lemma)
 
-    final_words = set()
-    for word, counts in word_tag_counts.items():
-        dom_cat = counts.most_common(1)[0][0]
-        final_words.add(lemmatizer.lemmatize(word, pos=dom_cat))
-    return list(final_words)
+    # De-duplicate for each subject
+    for sub_id in subject_vocabs:
+        subject_vocabs[sub_id] = sorted(list(set(subject_vocabs[sub_id])))
+        print(f"Subject {sub_id}: {len(subject_vocabs[sub_id])} unique words.")
+        
+    return subject_vocabs
 
-def build_corpus(mode="imagenet", dataset_path=None, output_path="data/corpus.pt"):
+def build_subject_corpora(dataset_path, output_dir="data/subject_corpora"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(output_dir, exist_ok=True)
     
-    if mode == "brown":
-        print("Building Brown Corpus (50k words)...")
-        words = brown.words()
-        stop_words = set(stopwords.words('english'))
-        clean = [w.lower() for w in words if w.isalpha() and w.lower() not in stop_words and len(w) > 2]
-        vocab = [w for w, _ in Counter(clean).most_common(50000)]
-    else:
-        print(f"Building ImageNet Corpus from {dataset_path}...")
-        vocab = get_imagenet_vocab(dataset_path)
+    # 1. Load Dataset and Extract Vocabs
+    dataset = torch.load(dataset_path, map_location='cpu')
+    subject_vocabs = extract_subject_vocab(dataset)
 
-    # CLIP Encoding (ViT-L/14 to match DreamDiffusion)
-    model, _ = clip.load("ViT-L/14", device=device)
-    all_embs = []
-    
-    print(f"Encoding {len(vocab)} words...")
-    for i in tqdm(range(0, len(vocab), 512)):
-        batch = vocab[i:i+512]
-        tokens = clip.tokenize(batch).to(device)
-        with torch.no_grad():
-            embs = model.encode_text(tokens)
-            embs /= embs.norm(dim=-1, keepdim=True)
-            all_embs.append(embs.cpu())
+    # 2. Load CLIP ViT-B/32 (Matches ChannelNet 512-D space)
+    print(f"Loading CLIP ViT-B/32 on {device}...")
+    model, _ = clip.load("ViT-B/32", device=device)
 
-    output_path = "data/" + mode + "_corpus.pt"
-    torch.save({"words": vocab, "embeddings": torch.cat(all_embs)}, output_path)
-    print(f"✅ Corpus saved to {output_path}")
+    # 3. Encode and Save per Subject
+    for sub_id, vocab in subject_vocabs.items():
+        print(f"\n--- Encoding Corpus for Subject {sub_id} ---")
+        all_embs = []
+        batch_size = 512
+        
+        for i in range(0, len(vocab), batch_size):
+            batch = vocab[i:i+batch_size]
+            tokens = clip.tokenize(batch).to(device)
+            
+            with torch.no_grad():
+                embs = model.encode_text(tokens)
+                embs /= embs.norm(dim=-1, keepdim=True)
+                
+                # Ensure [1, 512] shape for consistent alignment
+                for j in range(embs.size(0)):
+                    all_embs.append(embs[j:j+1].cpu())
+
+        # Save Subject-Specific File
+        final_tensor = torch.stack(all_embs) # Shape: [Vocab_Size, 1, 512]
+        output_path = os.path.join(output_dir, f"subject_{sub_id}_train_corpus.pt")
+        
+        torch.save({
+            "subject": sub_id,
+            "words": vocab, 
+            "embeddings": final_tensor 
+        }, output_path)
+        print(f"Saved to {output_path}")
 
 if __name__ == "__main__":
-    # Example usage
-    build_corpus(mode="imagenet", dataset_path="data/eeg_5_95_text_dataset_train.pth")
+    build_subject_corpora(
+        dataset_path="data/eeg_55_95_text_dataset_train.pth"
+    )
