@@ -1,78 +1,136 @@
-# EEG2Text
+# SENSE: Efficient EEG-to-Text via Privacy-Preserving Semantic Retrieval
 
-This repository contains the infrastructure for converting EEG signals into English text by aligning neural embeddings with the CLIP semantic space. The project bypasses traditional end-to-end LLM fine-tuning by leveraging pre-trained multi-modal encoders and Large Language Models as decoders.
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+
+**SENSE (SEmantic Neural Sparse Extraction)** is a lightweight, privacy-preserving framework that translates non-invasive electroencephalography (EEG) signals into fluent natural language without the need for memory-intensive Large Language Model (LLM) fine-tuning.
+
+
+## Key Features
+
+* **Modular Architecture**: Decouples neural decoding into local semantic retrieval and prompt-based language generation.
+* **Privacy-Preserving**: Raw EEG signals remain on-device; only abstract semantic keywords (Bag-of-Words) are shared with LLM APIs.
+* **Lightweight**: The EEG-to-keyword module contains only ~6M parameters and completes training in minutes.
+* **Zero-Shot Generation**: Leverages off-the-shelf LLMs (Gemini, GPT-4, LLaMA) via structured prompting to synthesize text.
+* **Cross-Subject Generalization**: Demonstrates consistent performance across diverse neural patterns without per-subject calibration.
 
 ---
 
-## Current Progress
-
-The pipeline is currently functional through the **Data Ingestion** and **Embedding Alignment** phases:
-
-1. **EEG Encoding**: Raw EEG tensors are processed through a Masked Autoencoder (MAE) to extract high-dimensional neural features.
-2. **CLIP Mapping**: These features are projected via a learned linear layer into the 768-dimensional CLIP latent space, allowing for direct comparison with text embeddings.
-3. **Global Noise Centering**: The system calculates a dataset-wide mean vector to center EEG latents, significantly improving retrieval accuracy by removing common-mode neural noise.
-
----
-
-## File Structure
-
-The project is organized into a modular hierarchy to allow for easy swapping of encoders and datasets.
+## Codebase Structure
 
 ```text
-.
-├── run_pipeline.py           # Main entry point for the end-to-end pipeline
-├── README.md                 # Project documentation
-├── sc_mbm/                   # Core research code for the DreamDiffusion MAE
-│   ├── mae_for_eeg.py        # EEG Encoder architecture
-│   ├── trainer.py            # Training logic for the encoder
-│   └── utils.py              # Helper functions for sc_mbm
-├── src/                      # Source modules for pipeline steps
-│   ├── encoders.py           # Logic to manage different EEG encoders (e.g., DreamDiffusion)
-│   ├── aligner.py            # Similarity search and noise centering logic
-│   ├── build_corpus.py       # One-time script to generate CLIP-encoded word indices
-│   ├── llm_client.py         # API interface for GPT-4, Gemini, and Claude
-│   └── metrics.py            # NLP evaluation metrics (BLEU, ROUGE, BERTScore)
-├── scripts/                  # Standalone utility scripts
-│   └── evaluate.py           # Post-generation evaluation script
-├── data/                     # Raw EEG datasets and processed word corpora
-└── models/                   # Model checkpoints and weights
-
+SENSE/
+├── run_pipeline.py          # Main orchestrator (Encoding -> Alignment -> LLM -> Eval)
+├── env.yaml                 # Conda environment configuration
+├── src/
+│   ├── models.py            # MLP Similarity Refiner & Loss functions (Focal, Contrastive, BCE)
+│   ├── trainer.py           # Training logic & N-Hot Vector Encoding
+│   ├── aligner.py           # Semantic alignment and Cosine Similarity engine
+│   ├── encoders.py          # Frozen ChannelNet EEG-to-CLIP latent extraction
+│   ├── llm_client.py        # Multi-provider LLM manager (OpenAI, Gemini, Together AI)
+│   └── metrics.py           # Evaluation suite (BLEU, ROUGE, METEOR, BERTScore)
+├── scripts/
+│   └── prepare_dataset.py   # Pre-processing script for ImageNet-EEG data
+├── data/                    # Storage for .pth datasets and word corpus
+├── checkpoints/             # Trained MLP weights (.pth)
+└── results/                 # Generated captions and metrics
 ```
-
 ---
 
-## Pipeline Components
-
-### 1. Encoders (`src/encoders.py`)
-
-Responsible for loading model checkpoints and performing the forward pass from raw EEG to 1024-D or 768-D CLIP latents. It handles specific preprocessing like time-dimension padding. For now, only has support for dreamdiffusion
-
-### 2. Aligner (`src/aligner.py`)
-
-Computes the cosine similarity between centered EEG latents and a pre-built word corpus. It outputs a "Bag of Words" (BoW) sorted by semantic relevance.
-
-### 3. Build Corpus (`src/build_corpus.py`)
-
-A utility to extract high-frequency nouns, verbs, and adjectives from a dataset (like ImageNet) and encode them into CLIP space. This serves as the searchable dictionary for the pipeline.
-
----
-## Environment setup (Only DreamDiffusion support right now)
-
-Create and activate conda environment named ```dreamdiffusion``` from the ```env.yaml```
-```sh
+## Installation
+### 1. Create Conda Environment
+```
 conda env create -f env.yaml
-conda activate dreamdiffusion
+conda activate sense_env
 ```
 
-## Usage
+### 2. Configure API Keys
 
-To run the pipeline from start to the current encoding milestone:
+SENSE supports multiple LLM providers.
 
-```bash
-python run_pipeline.py --dataset_path data/your_dataset.pth --output_dir ./data --eeg_encoder dream_diffusion
+Create a `.env` file in the repository root:
 
 ```
+OPENAI_API_KEY=your_key_here
+TOGETHER_API_KEY=your_key_here
+GOOGLE_API_KEY=your_key_here
+```
+---
+## Dataset Preparation
+
+The ImageNet-EEG dataset may be distributed across multiple folders.
+
+Use the provided preprocessing script to consolidate everything into a single `.pth` dataset.
+
+```python scripts/prepare_dataset.py```
 
 ---
 
-**Next Steps**: Implementation of the unified `llm_client.py` to convert retrieved word clusters into coherent captions and integrating the automated evaluation suite.
+## Running the pipeline
+All experiments are controlled via `run_pipeline.py`. You can toggle between three main modes: 
+
+### 1. Naive Baseline (No Training)
+
+Direct cosine similarity between EEG latents and CLIP vocabulary embeddings.
+
+``` 
+python run_pipeline.py
+--dataset data/eeg_test.pth
+--mode naive
+--top_k 15
+```
+### 2. Train Similarity Refiner
+Trains the MLP projection layer that aligns EEG embeddings with the CLIP semantic space.
+
+```
+python run_pipeline.py
+--dataset data/imagenet_eeg_train.pth
+--mode train
+--loss focal
+--epochs 50
+```
+Available loss functions:
+
+- `bce`
+- `contrastive`
+- `focal`
+
+The trained model is saved in `checkpoints/`
+
+### 3. Inference + Caption Generation
+
+Runs the full pipeline:
+```
+EEG → semantic retrieval → LLM caption generation → evaluation
+```
+```python run_pipeline.py
+--dataset data/eeg_test.pth
+--mode inference
+--checkpoint checkpoints/mlp_focal_100eps.pth
+--loss focal
+```
+
+---
+## Privacy Design
+
+SENSE is designed with **neural data privacy in mind**.
+
+Raw EEG signals never leave the local device, only **abstract semantic tokens** are sent to LLMs.
+
+This allows:
+
+- local deployment
+- privacy-preserving BCI systems
+- compatibility with external APIs
+
+---
+
+## Experimental Dataset
+
+Experiments use the **ImageNet EEG dataset**:
+
+- 128-channel EEG
+- 6 subjects
+- ~10k EEG samples
+- images paired with captions
+

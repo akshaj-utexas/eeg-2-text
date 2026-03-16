@@ -1,234 +1,254 @@
-import torch
 import pandas as pd
+import numpy as np
 import nltk
-import matplotlib.pyplot as plt
-import seaborn as sns
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from nltk.translate.meteor_score import meteor_score
-from rouge_score import rouge_scorer
-from tqdm import tqdm
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+from nltk.translate.meteor_score import single_meteor_score
+from nltk.tokenize import word_tokenize
+from rouge import Rouge
+import bert_score
+import statistics
+import re
+import os
+import tqdm
+import json
 
-# Ensure NLTK resources are ready
+# Ensure NLTK resources are available
 nltk.download('punkt', quiet=True)
 nltk.download('wordnet', quiet=True)
 
-def calculate_metrics(results_path):
+def read_result_csv(file_path):
+    # Load the CSV. We no longer drop the first column 
+    # because 'subject' is now the first column.
+    result_df = pd.read_csv(file_path)
+    return result_df
+
+def compute_bleu(reference, candidate):
+    reference = [[ref.split()] for ref in reference]
+    candidate = [cand.split() for cand in candidate]
+    smoothing_function = SmoothingFunction().method4
+    bleu_scores = [corpus_bleu([ref], [cand], smoothing_function=smoothing_function) for ref, cand in zip(reference, candidate)]
+    return round(np.mean(bleu_scores), 3), round(np.std(bleu_scores), 3)
+
+def compute_bleu_unigram(reference, candidate):
+    reference = [[ref.split()] for ref in reference]
+    candidate = [cand.split() for cand in candidate]
+    smoothing_function = SmoothingFunction().method4
+    weights = (1, 0, 0, 0)
+    bleu_scores = [corpus_bleu([ref], [cand], smoothing_function=smoothing_function, weights=weights) for ref, cand in zip(reference, candidate)]
+    return round(np.mean(bleu_scores), 3), round(np.std(bleu_scores), 3)
+
+def compute_rouge(reference, candidate):
+    rouge = Rouge()
+    rouge_scores = [rouge.get_scores(cand, ref, avg=True) for ref, cand in zip(reference, candidate)]
+    
+    r1 = [score['rouge-1']['f'] for score in rouge_scores]
+    r2 = [score['rouge-2']['f'] for score in rouge_scores]
+    rl = [score['rouge-l']['f'] for score in rouge_scores]
+
+    return (round(np.mean(r1), 3), round(np.mean(r2), 3), round(np.mean(rl), 3), 
+            round(np.std(r1), 3), round(np.std(r2), 3), round(np.std(rl), 3))
+
+def compute_bert_score(reference, candidate):
+    bert_p, bert_r, bert_f1 = bert_score.score(candidate, reference, lang="en", verbose=False)
+    return round(bert_f1.mean().item(), 3), round(bert_f1.std().item(), 3)
+
+def compute_meteor_scores(reference, candidate):
+    tokenized_candidates = [word_tokenize(c.replace("<s>", "").replace("</s>", "").strip()) for c in candidate]
+    tokenized_references = [word_tokenize(r) for r in reference]
+    meteor_scores = [single_meteor_score(ref, cand) for ref, cand in zip(tokenized_references, tokenized_candidates)]
+    return round(np.mean(meteor_scores), 3), round(statistics.stdev(meteor_scores), 3)
+
+def clean_text(text):
+    regex = r"[^a-zA-Z0-9.,!?;:'\"()\[\]{}\-\s]"
+    cleaned_text = re.sub(regex, '', str(text))
+    lines = re.split(r'(?<=[.!?]) +', cleaned_text)
+    unique_lines = []
+    seen = set()
+    for line in lines:
+        cleaned_line = re.sub(r'\s+', ' ', line).strip()
+        if cleaned_line not in seen:
+            seen.add(cleaned_line)
+            unique_lines.append(cleaned_line)
+    return ' '.join(unique_lines[:1])
+
+def cleanup_pred_captions(predicted_captions):
+    predicted_captions = predicted_captions.fillna('')
+    clean_captions = []
+    for caption in predicted_captions:
+        clean_caption = clean_text(caption) if caption.strip() else "No response."
+        if not clean_caption.strip():
+            clean_caption = "No response."
+        clean_captions.append(clean_caption)
+    return clean_captions
+
+def run(csv_path):
+    results = {}
+    result_df = read_result_csv(csv_path)
+
+    # --- ADJUSTED COLUMN MAPPINGS ---
+    expected_captions = result_df['gt_caption']
+    predicted_captions = result_df['generated_caption']
+    # Note: image_paths are not in the new CSV, so we omit them.
+    # expected_object_classes = result_df['gt_object']
+    # predicted_object_classes = result_df['predicted_object']
+
+    predicted_captions = cleanup_pred_captions(predicted_captions)
+    references = expected_captions.tolist()
+    candidates = predicted_captions
+
+    for i, cand in enumerate(candidates):
+        if len(cand) <= 1:
+            candidates[i] = "No response"
+
+    # BLEU Scores
+    mean_b, std_b = compute_bleu(references, candidates)
+    results["Mean BLEU Score"] = mean_b
+    results["SD BLEU Score"] = std_b
+
+    mean_bu, std_bu = compute_bleu_unigram(references, candidates)
+    results["Mean BLEU Unigram Score"] = mean_bu
+    results["SD BLEU Unigram Score"] = std_bu
+
+    # ROUGE Scores
+    r1, r2, rl, r1_s, r2_s, rl_s = compute_rouge(references, candidates)
+    results["Mean ROUGE-1"] = r1
+    results["SD ROUGE-1"] = r1_s
+    results["Mean ROUGE-2"] = r2
+    results["SD ROUGE-2"] = r2_s
+    results["Mean ROUGE-l"] = rl
+    results["SD ROUGE-l"] = rl_s
+
+    # METEOR Score
+    mean_m, std_m = compute_meteor_scores(references, candidates)
+    results["Mean Meteor Score"] = mean_m
+    results["SD Meteor Score"] = std_m
+
+    # BERT Score
+    # bert_m, bert_s = compute_bert_score(references, candidates)
+    # results["Mean BERTScore"] = bert_m
+    # results["SD BERTScore"] = bert_s
+    
+    return results 
+
+import os
+import json
+import pandas as pd
+
+def evaluate_and_save_metrics(csv_path, output_dir="results"):
     """
-    Calculates detailed NLP metrics and generates presentation-ready wide plots.
+    Processes a single CSV file, calculates metrics, and saves results to CSV/JSON.
     """
-    # 1. Load the data
-    print(f"Loading results from {results_path}...")
-    data = torch.load(results_path)
-    
-    # 2. Setup Scorer (Added ROUGE-1 and ROUGE-2)
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-    smooth = SmoothingFunction().method1
-    
-    all_metrics = []
+    if not os.path.exists(csv_path):
+        print(f"⚠️ Could not find the file: {csv_path}. Skipping...")
+        return
 
-    print("Computing metrics for all samples...")
-    for item in tqdm(data):
-        gt = item['gt_caption'].lower().strip()
-        gen = item['generated_caption'].lower().strip()
+    print(f"📊 Running evaluation for: {csv_path}")
+    # Standardize output to the pipeline's output directory
+    eval_dir = os.path.join(output_dir, "metrics")
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    # Generate dynamic filenames based on the input filename
+    base_name = os.path.splitext(os.path.basename(csv_path))[0]
+    csv_output = os.path.join(eval_dir, f"metrics_{base_name}.csv")
+    json_output = os.path.join(eval_dir, f"averaged_{base_name}.json")
+
+    try:
+        # 1. Run the metrics calculation
+        results = run(csv_path=csv_path)
+
+        averaged_results_dict = {}
+        # 2. Process and format results
+        for key, value in results.items():
+            if "Mean" in key:
+                # Store as percentage and update original results for the DataFrame
+                formatted_val = round(value * 100, 2)
+                averaged_results_dict[key] = formatted_val
+                results[key] = formatted_val
+            else:
+                averaged_results_dict[key] = value
+
+        # 3. Display and Save to CSV
+        results_df = pd.DataFrame([results])
+        print(f"\n--- EVALUATION RESULTS: {base_name} ---")
+        print(results_df.to_string(index=False))
         
-        gt_tokens = nltk.word_tokenize(gt)
-        gen_tokens = nltk.word_tokenize(gen)
+        results_df.to_csv(csv_output, index=False)
 
-        # BLEU Calculations
-        bleu1 = sentence_bleu([gt_tokens], gen_tokens, weights=(1, 0, 0, 0), smoothing_function=smooth)
-        bleu4 = sentence_bleu([gt_tokens], gen_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smooth)
+        # 4. Save to JSON
+        with open(json_output, "w") as f:
+            json.dump(averaged_results_dict, f, indent=4)
+            
+        print(f"Saved results to '{csv_output}' and '{json_output}'\n")
         
-        # ROUGE Calculations
-        rs = scorer.score(gt, gen)
-        r1 = rs['rouge1'].fmeasure
-        r2 = rs['rouge2'].fmeasure
-        rl = rs['rougeL'].fmeasure
-        
-        # METEOR
-        met = meteor_score([gt_tokens], gen_tokens)
+    except Exception as e:
+        print(f"Error during processing {csv_path}: {e}")
 
-        all_metrics.append({
-            "subject": int(item['subject']), # Cast to int for sorting
-            "bleu1": bleu1,
-            "bleu4": bleu4,
-            "rouge1": r1,
-            "rouge2": r2,
-            "rougeL": rl,
-            "meteor": met
-        })
 
-    # 3. Aggregate and Process
-    df = pd.DataFrame(all_metrics).sort_values('subject')
-    metrics_cols = ['bleu1', 'bleu4', 'rouge1', 'rouge2', 'rougeL', 'meteor']
-    subject_summary = df.groupby('subject')[metrics_cols].mean() * 100
-    overall_summary = df[metrics_cols].mean() * 100
 
-    # 4. Print Numbers for the Meeting
-    print("\n" + "="*90)
-    print("      📊 STRATIFIED DECODING PERFORMANCE: SUBJECT-WISE SUMMARY (%)")
-    print("="*90)
-    fmt = {c: '{:0.2f}'.format for c in metrics_cols}
-    print(subject_summary.to_string(formatters=fmt))
-    print("-" * 90)
-    print(f"OVERALL AVG | B1: {overall_summary['bleu1']:.2f} | B4: {overall_summary['bleu4']:.2f} | R1: {overall_summary['rouge1']:.2f} | R2: {overall_summary['rouge2']:.2f} | RL: {overall_summary['rougeL']:.2f} | MET: {overall_summary['meteor']:.2f}")
-    print("="*90)
-
-    # 5. GENERATE PRESENTATION PLOTS
-    print("Creating visualization suite...")
-    sns.set_theme(style="whitegrid")
-    
-    # We will create 3 plots: BLEU, ROUGE, and METEOR (wide aspect)
-    plot_data = subject_summary.reset_index()
-    
-    # Setup Figure with 3 subplots vertically to allow for WIDE layout
-    fig, axes = plt.subplots(3, 1, figsize=(14, 18))
-    plt.subplots_adjust(hspace=0.4)
-
-    # --- Plot A: BLEU Metrics (Precision) ---
-    bleu_df = plot_data.melt(id_vars='subject', value_vars=['bleu1', 'bleu4'], var_name='Metric', value_name='Score')
-    sns.barplot(ax=axes[0], data=bleu_df, x='subject', y='Score', hue='Metric', palette='Blues_d')
-    axes[0].set_title("BLEU Performance: Unigrams (B1) vs Quadgrams (B4)", fontsize=16, fontweight='bold')
-    axes[0].set_ylabel("Score (%)", fontsize=12)
-
-    # --- Plot B: ROUGE Metrics (Recall/Sequence) ---
-    rouge_df = plot_data.melt(id_vars='subject', value_vars=['rouge1', 'rouge2', 'rougeL'], var_name='Metric', value_name='Score')
-    sns.barplot(ax=axes[1], data=rouge_df, x='subject', y='Score', hue='Metric', palette='Greens_d')
-    axes[1].set_title("ROUGE Performance: Content Overlap (R1, R2, RL)", fontsize=16, fontweight='bold')
-    axes[1].set_ylabel("Score (%)", fontsize=12)
-
-    # --- Plot C: METEOR (Semantic Alignment) ---
-    sns.barplot(ax=axes[2], data=plot_data, x='subject', y='meteor', color='salmon', alpha=0.8)
-    axes[2].set_title("METEOR Performance: Semantic & Synonym Matching", fontsize=16, fontweight='bold')
-    axes[2].set_ylabel("Score (%)", fontsize=12)
-
-    # Final touches to all plots
-    for ax in axes:
-        ax.set_xlabel("Subject ID", fontsize=12)
-        ax.set_ylim(0, max(overall_summary) + 15) # Dynamic ceiling
-        # Add labels on top of bars
-        for p in ax.patches:
-            if p.get_height() > 0:
-                ax.annotate(f'{p.get_height():.1f}%', 
-                            (p.get_x() + p.get_width() / 2., p.get_height()), 
-                            ha='center', va='center', fontsize=10, color='black', xytext=(0, 8), 
-                            textcoords='offset points')
-
-    # Save
-    plot_path = results_path.replace('.pt', '_full_presentation_suite.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    print(f"✅ Presentation suite saved to {plot_path}")
-    
-    # Save CSV
-    df.to_csv(results_path.replace('.pt', '_full_meeting_metrics.csv'), index=False)
-
+# --- ONE-FILE EXECUTION BLOCK ---
 if __name__ == "__main__":
-    calculate_metrics("results/all_subjects_feb20_linear_boost.pt")
 
-# import torch
-# import pandas as pd
-# import nltk
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-# from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-# from nltk.translate.meteor_score import meteor_score
-# from rouge_score import rouge_scorer
-# from tqdm import tqdm
+    # --- HOW TO RUN FOR 6 FILES ---
+    files_to_process = [
+        "results/ablation_modified_bow/llama_3_8b/mlp_test_llm_no_object_label_llama_3_8b_contrastive_multilabel_loss.csv",
+        "results/ablation_modified_bow/llama_3_8b/mlp_test_llm_no_object_label_llama_3_8b_focal_loss_learnt_scaling.csv",
+        "results/ablation_modified_bow/llama_3_8b/mlp_test_llm_no_object_label_llama_3_8b_learnt_scaling.csv",
+        "results/ablation_modified_bow/llama_3_8b/mlp_test_llm_no_object_label_llama_3_8b_naive_baseline.csv",
+        "results/ablation_modified_bow/chatgpt/mlp_test_llm_no_object_label_chatgpt_contrastive_multilabel_loss.csv",
+        "results/ablation_modified_bow/chatgpt/mlp_test_llm_no_object_label_chatgpt_focal_loss_learnt_scaling.csv",
+        "results/ablation_modified_bow/chatgpt/mlp_test_llm_no_object_label_chatgpt_learnt_scaling.csv",
+        "results/ablation_modified_bow/chatgpt/mlp_test_llm_no_object_label_chatgpt_naive_baseline.csv",
+        "results/ablation_modified_bow/gemini/mlp_test_llm_no_object_label_gemini_contrastive_multilabel_loss.csv",
+        "results/ablation_modified_bow/gemini/mlp_test_llm_no_object_label_gemini_focal_loss_learnt_scaling.csv",
+        "results/ablation_modified_bow/gemini/mlp_test_llm_no_object_label_gemini_learnt_scaling.csv",
+        "results/ablation_modified_bow/gemini/mlp_test_llm_no_object_label_gemini_naive_baseline.csv",
+        "results/ablation_modified_bow/qwen_2.5_7b/mlp_test_llm_no_object_label_qwen_2.5_7b_contrastive_multilabel_loss.csv",
+        "results/ablation_modified_bow/qwen_2.5_7b/mlp_test_llm_no_object_label_qwen_2.5_7b_focal_loss_learnt_scaling.csv",
+        "results/ablation_modified_bow/qwen_2.5_7b/mlp_test_llm_no_object_label_qwen_2.5_7b_learnt_scaling.csv",
+        "results/ablation_modified_bow/qwen_2.5_7b/mlp_test_llm_no_object_label_qwen_2.5_7b_naive_baseline.csv",
+    ]
 
-# # Ensure NLTK resources are ready
-# nltk.download('punkt', quiet=True)
-# nltk.download('wordnet', quiet=True)
-
-# def calculate_metrics(results_path):
-#     """
-#     Calculates BLEU-1, BLEU-3, and other metrics from the decoded results and generates a plot.
-#     """
-#     # 1. Load the data
-#     print(f"Loading results from {results_path}...")
-#     data = torch.load(results_path)
+    for file in files_to_process:
+        evaluate_and_save_metrics(file)
+    # # 1. Point this to your specific CSV file
+    # my_csv_file = "results/mlp_test_llm_output_100_epoch_contrastive_multilabel_loss.csv"  # <-- CHANGE THIS to your filename
     
-#     # 2. Setup Scorer
-#     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-#     smooth = SmoothingFunction().method1
-    
-#     all_metrics = []
-
-#     print("Computing metrics for all samples...")
-#     for item in tqdm(data):
-#         gt = item['gt_caption'].lower().strip()
-#         gen = item['generated_caption'].lower().strip()
+    # if os.path.exists(my_csv_file):
+    #     print(f"📊 Running evaluation for: {my_csv_file}")
         
-#         gt_tokens = nltk.word_tokenize(gt)
-#         gen_tokens = nltk.word_tokenize(gen)
+    #     # 2. Run the metrics calculation
+    #     try:
+    #         results = run(csv_path=my_csv_file)
 
-#         # NLP Metrics calculation
-#         bleu1 = sentence_bleu([gt_tokens], gen_tokens, weights=(1, 0, 0, 0), smoothing_function=smooth)
-#         bleu3 = sentence_bleu([gt_tokens], gen_tokens, weights=(0.33, 0.33, 0.33, 0), smoothing_function=smooth)
-#         bleu4 = sentence_bleu([gt_tokens], gen_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smooth)
-#         rougeL = scorer.score(gt, gen)['rougeL'].fmeasure
-#         met = meteor_score([gt_tokens], gen_tokens)
+    #         averaged_results_dict = {}
+    #         for key, value in results.items():
+    #             if "Mean" in key:
+    #                 # Store as a list: {"Metric Name": [Score]}
+    #                 averaged_results_dict[key] = round(value * 100, 2)
+    #             else:
+    #                 # Keep SD as is but in list format for consistency
+    #                 averaged_results_dict[key] = value
 
-#         all_metrics.append({
-#             "subject": item['subject'],
-#             "bleu1": bleu1,
-#             "bleu3": bleu3,
-#             "bleu4": bleu4,
-#             "rougeL": rougeL,
-#             "meteor": met
-#         })
+    #         # multiply all mean scores by 100 for percentage format
+    #         for key in results:
+    #             if "Mean" in key:
+    #                 results[key] = round(results[key] * 100, 2)
+    #         # 3. Display and Save Results
+    #         results_df = pd.DataFrame([results])
+    #         print("\n--- 📈 EVALUATION RESULTS ---")
+    #         print(results_df.to_string(index=False))
+            
+    #         # Optional: Save results to a new CSV
+    #         results_df.to_csv("metrics_output_100_epoch_contrastive_multilabel_loss.csv", index=False)
 
-#     # 3. Aggregate Subject-Wise Stats
-#     df = pd.DataFrame(all_metrics)
-#     metrics_cols = ['bleu1', 'bleu3', 'bleu4', 'rougeL', 'meteor']
-#     subject_summary = df.groupby('subject')[metrics_cols].mean() * 100
-#     overall_summary = df[metrics_cols].mean() * 100
-
-#     # 4. Final Formatted Report
-#     print("\n" + "="*80)
-#     print("      📊 SUBJECT-WISE PERFORMANCE REPORT (%)")
-#     print("="*80)
-#     fmt = {c: '{:0.2f}'.format for c in metrics_cols}
-#     print(subject_summary.to_string(formatters=fmt))
-#     print("-" * 80)
-#     print(f"OVERALL AVG | B1: {overall_summary['bleu1']:.2f} | B3: {overall_summary['bleu3']:.2f} | B4: {overall_summary['bleu4']:.2f} | RL: {overall_summary['rougeL']:.2f} | MET: {overall_summary['meteor']:.2f}")
-#     print("="*80)
-
-#     # 5. GENERATE PLOT
-#     print("Generating subject-wise performance plot...")
-#     sns.set_theme(style="whitegrid")
-    
-#     # Reshape data for plotting
-#     plot_df = subject_summary.reset_index().melt(
-#         id_vars='subject', 
-#         var_name='Metric', 
-#         value_name='Score (%)'
-#     )
-    
-#     # Create the grouped bar chart
-#     # Use a clear palette and ensure bars are sorted by subject ID
-#     ax = sns.barplot(
-#         data=plot_df, 
-#         x='subject', 
-#         y='Score (%)', 
-#         hue='Metric', 
-#         palette='viridis'
-#     )
-    
-#     # Formatting
-#     plt.title("Subject-wise Decoding Performance Across Metrics", fontsize=14, pad=15)
-#     plt.xlabel("Subject ID", fontsize=12)
-#     plt.ylabel("Average Score (%)", fontsize=12)
-#     plt.legend(title="NLP Metric", bbox_to_anchor=(1.05, 1), loc='upper left')
-#     plt.tight_layout()
-    
-#     # Save the figure
-#     plot_path = results_path.replace('.pt', '_performance_plot.png')
-#     plt.savefig(plot_path, dpi=300)
-#     print(f"✅ Plot saved to {plot_path}")
-    
-#     # Save the expanded metrics CSV
-#     csv_path = results_path.replace('.pt', '_expanded_metrics.csv')
-#     df.to_csv(csv_path, index=False)
-#     print(f"✅ Detailed metrics saved to {csv_path}")
-
-# if __name__ == "__main__":
-#     calculate_metrics("results/feb_20_final_generations_stratified.pt")
+    #         # 4. Save to JSON (The new requested format)
+    #         json_output_path = "averaged_metrics_mlp_100_epoch_contrastive_multilabel_loss.json"
+    #         with open(json_output_path, "w") as f:
+    #             json.dump(averaged_results_dict, f, indent=4)
+                
+    #         print(f"✅ Average dictionary saved to '{json_output_path}'")
+            
+    #     except Exception as e:
+    #         print(f"❌ Error during processing: {e}")
+    # else:
+    #     print(f"⚠️ Could not find the file: {my_csv_file}. Please check the path!")

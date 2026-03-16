@@ -14,47 +14,19 @@ class Aligner:
             self.word_embs = self.word_embs.squeeze(1) 
 
     @torch.no_grad()
-    def align(self, eeg_latent, noise=None, predicted_label=None, confidence=None, boost_mode="linear", top_k=15):
+    def align(self, eeg_latent, predicted_label=None, confidence=None, top_k=15):
         # 1. Ensure EEG latent is float32 and on correct device
         vec = eeg_latent.to(self.device).float()
         
-        # 2. Global Noise Centering (if provided)
-        if noise is not None:
-            vec = vec - noise.to(self.device).float()
             
-        # 3. Normalize for Cosine Similarity
+        # 2. Normalize for Cosine Similarity
         vec = F.normalize(vec, p=2, dim=-1)
         
-        # 4. Similarity Search: [1, 512] @ [512, Vocab] -> [Vocab]
+        # 3. Similarity Search: [1, 512] @ [512, Vocab] -> [Vocab]
         # Using .squeeze() to ensure it's a 1D similarity vector
-        sims = (vec @ self.word_embs.T).squeeze()
-
-
-        # LOGARITHMIC BOOSTING LOGIC
-        if predicted_label and confidence is not None:
-            target_word = predicted_label.lower().strip()
-            if target_word in self.word_to_idx:
-                idx = self.word_to_idx[target_word]
-                
-                if boost_mode == "additive":
-                    # Lambda controls the "gravity" of the prior
-                    # Resulting scores may be negative; sims.topk() handles this
-                    lambda_weight = 0.1 
-                    sims[idx] += lambda_weight * torch.log(torch.tensor(confidence + 1e-6))
-                
-                elif boost_mode == "multiplicative":
-                    # Beta controls the saturation curve
-                    beta = 0.5
-                    multiplier = 10.0
-                    boost = 1 + beta * torch.log(1 + torch.tensor(confidence * multiplier))
-                    sims[idx] *= boost
-
-                elif boost_mode == "linear":
-                    boost_factor = 2.5
-                    idx = self.word_to_idx[target_word]
-                    sims[idx] *= boost_factor
+        sims = (vec @ self.word_embs.T).squeeze(0)
         
-        # 5. Retrieve Top-K
+        # 4. Retrieve Top-K
         scores, indices = sims.topk(min(top_k, len(self.words)))
         
         return [

@@ -1,66 +1,124 @@
 # import argparse
 # import sys
-# from typing import List
 # import os
-# from src.encoders import process_dream_diffusion
+# import torch
+# from tqdm import tqdm
+# from typing import List
+# from collections import defaultdict
+# import pandas as pd
+# # Path injection for safety
+# sys.path.append(os.getcwd())
+
+# # from src.encoders import process_dream_diffusion
 # from src.aligner import Aligner, calculate_noise
 # from src.llm_client import LLMManager
 
 # def parse_args():
-#     parser = argparse.ArgumentParser()
+#     parser = argparse.ArgumentParser(description="S2S: Neural Signal to Semantic Pipeline")
     
 #     # Paths and Data
-#     parser.add_argument("--dataset", type=str, default="imagenet_eeg", help="Path to the EEG dataset")
-#     # parser.add_argument("--word_corpus", type=str, required=True, help="Path to the word corpus file")
+#     parser.add_argument("--dataset", type=str, default="imagenet_eeg_test", help="Path to the EEG dataset .pth file")
+#     parser.add_argument("--word_corpus", type=str, default="imagenet", help="Path to the pre-encoded word corpus .pt file")
 #     parser.add_argument("--output_dir", type=str, default="./results", help="Where to save embeddings and captions")
-#     parser.add_argument("--batch_size", type=int, default=64)
+#     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for EEG encoding")
     
 #     # Model Config
-#     parser.add_argument("--eeg_encoder", type=str, default="dream_diffusion", help="Name or path of the EEG encoder model")
-#     parser.add_argument("--device", type=str, default="cpu", help="cpu or cuda")
+#     parser.add_argument("--eeg_encoder", type=str, default="channelnet", help="Name of the EEG encoder model")
+#     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="cpu or cuda")
     
 #     # Pipeline Logic
-#     # parser.add_argument("--llms", nargs="+", default=["gpt-4"], help="LLMs to use (gpt-4, gemini, claude)")
-#     # parser.add_argument("--top_k", type=int, default=10, help="Number of words to retrieve per EEG segment")
-#     # parser.add_argument("--skip_eval", action="store_true", help="Skip the metrics calculation step")
+#     parser.add_argument("--llms", nargs="+", default=["openai"], help="LLMs to use (openai, google, anthropic)")
+#     parser.add_argument("--top_k", type=int, default=15, help="Number of words to retrieve per EEG segment")
+#     parser.add_argument("--sample_limit", type=int, default=None, help="Limit number of samples for LLM generation (to save credits)")
+#     parser.add_argument("--skip_llm", action="store_true", help="Skip the LLM generation step")
+#     parser.add_argument("--skip_eval", action="store_true", help="Skip the metrics calculation step")
 
 #     return parser.parse_args()
 
+# # import random 
+# import random
 # def main():
 #     args = parse_args()
 #     os.makedirs(args.output_dir, exist_ok=True)
     
-#     print(f"--- Starting Pipeline with {args.eeg_encoder} ---")
+#     print(f"--- Starting Baseline Pipeline with {args.eeg_encoder} ---")
 
-#     # 1. & 2. Load Data and Encode EEG -> CLIP Space
-#     # We combine these because the encoder logic handles the loading/saving internally for now
-#     clip_latents_path = os.path.join(args.output_dir, f"{args.eeg_encoder}_{args.dataset}_clip_latents.pt")
+#     # 1. & 2. EEG Encoding to CLIP Space
+#     dataset_name = os.path.basename(args.dataset).replace('.pth', '')
+#     clip_latents_path = "results/TESTING_channelnet_imagenet_eeg_test_clip_latents_with_pred_label_confidence.pt"
     
-#     if args.eeg_encoder == "dream_diffusion":
-#         process_dream_diffusion(args.dataset, clip_latents_path, args.device, args.batch_size)
+#     if not os.path.exists(clip_latents_path):
+#         print("Step 1: Encoding EEG signals...")
+#         if args.eeg_encoder == "channelnet":
+#             from src.encoders import process_channelnet
+#             process_channelnet(args.dataset, clip_latents_path, args.device, args.batch_size)
+#     else:
+#         print(f"Found existing latents at {clip_latents_path}, skipping encoding.")
 
-#     # works till here ^^
+#     # 3. Global Alignment (Baseline Approach)
+#     print("Step 2: Performing Global Alignment...")
 
-#     # aligner = Aligner(args.word_corpus, device=args.device)
-#     # dataset = torch.load(clip_latents_path)
-#     # noise = calculate_noise(dataset, device=args.device)
+#     latent_dataset = torch.load(clip_latents_path)
 
-#     # final_results = []
-#     # for item in dataset:
-#     #     bow_with_scores = aligner.align(item['eeg_clip_latent'], noise, top_k=args.top_k)
-#     #     final_results.append({
-#     #         "subject": item.get["subject"],
-#     #         "gt_caption": item.get["caption"],
-#     #         "bow": bow_with_scores  # contains words and their similarity scores as floats
-#     #         "prompt_words": [w['word'] for w in bow_with_scores]  # Just the words for LLM input
-#     #     })
+#     # Load ONE global corpus for all subjects
+#     global_corpus_path = "data/imagenet_corpus.pt" 
+#     if not os.path.exists(global_corpus_path):
+#         raise FileNotFoundError(f"Global corpus not found at {global_corpus_path}")
 
-#     # torch.save(final_results, os.path.join(args.output_dir, "aligned_results.pt"))
+#     # Initialize a single global Aligner
+#     global_aligner = Aligner(global_corpus_path, device=args.device)
     
-    
-#     # 3. Retrieve Words from Corpus (Next step)
-#     # 4. LLM Generation (Next step)
-#     # 5. Evaluation (Next step)
+#     aligned_results = []
+
+#     # Perform Alignment across the entire dataset using the global corpus
+#     for item in tqdm(latent_dataset, desc="Global Aligning"):
+#         sub_id = item.get("subject")
+#         pred_obj = item.get("predicted_object_label", None) 
+#         pred_conf = item.get("prediction_confidence", 0.0) 
+        
+#         # Call Aligner using the Global Corpus (Noise centering removed)
+#         bow_with_scores = global_aligner.align(
+#             item['eeg_clip_latent'],
+#             predicted_label=pred_obj,
+#             confidence=pred_conf,
+#             top_k=args.top_k
+#         )
+        
+#         # Maintain your specific .pt structure for metrics compatibility
+#         aligned_results.append({
+#             "subject": sub_id,
+#             "gt_object_label": item.get("object_label", ""),   
+#             "gt_caption": item.get("caption", ""),            
+#             "predicted_object_label": pred_obj,               
+#             "prediction_confidence": pred_conf,                 
+#             "bow": bow_with_scores,                           
+#             "prompt_words": [w['word'] for w in bow_with_scores]
+#         })
+
+#     # Save results to the specified baseline path
+#     aligned_path = os.path.join(args.output_dir, f"{dataset_name}_naive_baseline.pt")
+#     torch.save(aligned_results, aligned_path)
+#     print(f"✅ Step 2 Complete. Naive baseline results saved to {aligned_path}")
+#     exit()
+#     if not args.skip_llm:
+#         print("Step 3: Generating Captions via LLM APIs...")
+#         boosted_results_path = "results/imagenet_eeg_test_boosted_results_with_conf.pt"
+#         latent_dataset = torch.load(boosted_results_path)
+        
+
+#         # 3. Proceed with LLM Generation
+#         llm_manager = LLMManager(provider="openai", model_name="gpt-4o-mini-2024-07-18")
+#         final_output_path = os.path.join(args.output_dir, "all_subjects_feb20_linear_boost.pt")
+
+#         # Pass the sampled list directly to the experiment runner
+#         final_generations = llm_manager.run_decoding_experiment(
+#             input_path=boosted_results_path, # Update your method to accept this
+#             output_path=final_output_path
+#         )
+#         print(f"✅ Pipeline Complete. Samples saved to {final_output_path.replace('.pt', '.csv')}")
+#     # 5. Evaluation (To be implemented)
+#     if not args.skip_eval:
+#         print("Step 4: Running Evaluation Metrics (Coming Soon)...")
 
 # if __name__ == "__main__":
 #     main()
@@ -70,156 +128,163 @@ import sys
 import os
 import torch
 from tqdm import tqdm
-from typing import List
-from collections import defaultdict
+from torch.utils.data import DataLoader
 import pandas as pd
-# Path injection for safety
+
+# Path injection
 sys.path.append(os.getcwd())
 
-# from src.encoders import process_dream_diffusion
-from src.aligner import Aligner, calculate_noise
+from src.aligner import Aligner
 from src.llm_client import LLMManager
+from src.models import SimilarityRefiner
+from src.trainer import Stage1_5Dataset, run_training
+from src.metrics import evaluate_and_save_metrics
+from src.encoders import DATASET_REGISTRY
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="S2S: Neural Signal to Semantic Pipeline")
-    
+
+    parser = argparse.ArgumentParser(description="SENSE: SEmantic Neural Sparse Extraction Pipeline")
     # Paths and Data
-    parser.add_argument("--dataset", type=str, default="imagenet_eeg_train", help="Path to the EEG dataset .pth file")
-    parser.add_argument("--word_corpus", type=str, default="imagenet", help="Path to the pre-encoded word corpus .pt file")
-    parser.add_argument("--output_dir", type=str, default="./results", help="Where to save embeddings and captions")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for EEG encoding")
+    parser.add_argument("--dataset", type=str, default="imagenet_eeg_test", help="Path to the EEG dataset .pth file")
+    parser.add_argument("--vocab_path", type=str, default="data/imagenet_train_corpus.pt", help="Path to the encoded word corpus")
+    parser.add_argument("--output_dir", type=str, default="./pipeline_test", help="Where to save outputs")
+    parser.add_argument("--batch_size", type=int, default=64)
     
-    # Model Config
-    parser.add_argument("--eeg_encoder", type=str, default="channelnet", help="Name of the EEG encoder model")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="cpu or cuda")
-    parser.add_argument("--boost_mode", type=str, default="linear", help="Boosting mode for predicted label (linear, additive, multiplicative)")
+    # Mode Selection
+    parser.add_argument("--mode", type=str, choices=["naive", "train", "inference"], default="naive", 
+                        help="naive: Cosine Sim only | train: Train MLP | inference: Use trained MLP")
     
-    # Pipeline Logic
-    parser.add_argument("--llms", nargs="+", default=["openai"], help="LLMs to use (openai, google, anthropic)")
-    parser.add_argument("--top_k", type=int, default=10, help="Number of words to retrieve per EEG segment")
-    parser.add_argument("--sample_limit", type=int, default=None, help="Limit number of samples for LLM generation (to save credits)")
-    parser.add_argument("--skip_llm", action="store_true", help="Skip the LLM generation step")
-    parser.add_argument("--skip_eval", action="store_true", help="Skip the metrics calculation step")
+    # MLP Config
+    parser.add_argument("--loss", type=str, choices=["bce", "focal", "contrastive"], default="bce")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pth weights for inference")
+    parser.add_argument("--eeg_encoder", type=str, default="channelnet")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    
+    # LLM & Eval Logic
+    parser.add_argument("--top_k", type=int, default=15)
+    parser.add_argument("--skip_llm", action="store_true")
+    parser.add_argument("--skip_eval", action="store_true")
 
     return parser.parse_args()
 
-# import random 
-import random
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    print(f"--- Starting Pipeline with {args.eeg_encoder} ---")
+    os.makedirs("checkpoints", exist_ok=True)
 
-    # 1. & 2. EEG Encoding to CLIP Space
-    # Using os.path.basename to create a clean filename for latents
     dataset_name = os.path.basename(args.dataset).replace('.pth', '')
-    clip_latents_path = os.path.join(args.output_dir, f"{args.eeg_encoder}_{dataset_name}_train_clip_latents_with_pred_label_confidence.pt")
     
-    # Check if latents already exist to save time/compute
+    # 1. EEG Encoding Step (Assumes raw EEG -> CLIP latents)
+    # This logic checks for existing latents to save time/compute
+    clip_latents_path = os.path.join(args.output_dir, f"{dataset_name}_pipeline_test_latents.pt")
+    
     if not os.path.exists(clip_latents_path):
-        print("Step 1: Encoding EEG signals...")
-        if args.eeg_encoder == "dream_diffusion":
-            process_dream_diffusion(args.dataset, clip_latents_path, args.device, args.batch_size)
-        if args.eeg_encoder == "channelnet":
-            from src.encoders import process_channelnet
-            process_channelnet(args.dataset, clip_latents_path, args.device, args.batch_size)
+        print(f"--- Step 1: Encoding EEG via {args.eeg_encoder} ---")
+        from src.encoders import process_channelnet
+        process_channelnet(args.dataset, clip_latents_path, args.device, args.batch_size)
     else:
-        print(f"Found existing latents at {clip_latents_path}, skipping encoding.")
-    exit()
-    # 3. Retrieve Words from Corpus (Alignment)
-    print("Step 2: Aligning with Word Corpus...")
+        print(f"--- Found existing latents at {clip_latents_path} ---")
 
-    latent_dataset = torch.load(clip_latents_path)
-    # 3b. Pre-initialize Aligner objects for each subject
-    # We assume subject_corpora are in 'data/subject_corpora/' 
-    # as generated by our previous script.
-    subjects = sorted(list(set(item.get('subject') for item in latent_dataset)))
-    aligners = {}
+    # 2. Alignment Logic (The Core Switch)
+    final_alignment_path = ""
 
-    for sub_id in subjects:
-        corpus_path = os.path.join("data/subject_corpora", f"subject_{sub_id}_corpus.pt")
-        if os.path.exists(corpus_path):
-            print(f"  -> Loading Aligner for Subject {sub_id}...")
-            aligners[sub_id] = Aligner(corpus_path, device=args.device)
-        else:
-            print(f"  [!] Warning: Corpus not found for Subject {sub_id} at {corpus_path}")
+    dataset_path = DATASET_REGISTRY.get(args.dataset, None)
+    print(f"Dataset path for training: {dataset_path}")
 
-    # --- 3c. Calculate Noise PER SUBJECT (New logic) ---
-    # Group all samples by subject ID to calculate their specific means
-    print("Step 2b: Calculating subject-specific noise profiles...")
-    subject_groups = defaultdict(list)
-    for item in latent_dataset:
-        subject_groups[item.get('subject')].append(item['eeg_clip_latent'])
-
-    # Create a dictionary of mean noise vectors [1, 512] for each subject
-    sub_noises = {
-        sub_id: torch.stack(tensors).mean(dim=0).to(args.device) 
-        for sub_id, tensors in subject_groups.items()
-    }
-
-    # --- 3d. Perform Per-Subject Alignment ---
-    # --- Step 2: Subject-Specific Alignment with Dynamic Boosting ---
-    
-    
-    aligned_results = []
-
-    boost_mode = args.boost_mode
-
-    for item in tqdm(latent_dataset, desc="Aligning + Boosting"):
-        sub_id = item.get("subject")
-        pred_obj = item.get("predicted_object_label", None) # The encoder's guess
-        pred_conf = item.get("prediction_confidence", 0.0) # Confidence of the encoder's guess
+    if args.mode == "train":
+        print(f"--- Mode: Training MLP ({args.loss} loss) ---")
+        train_ds = Stage1_5Dataset(clip_latents_path, args.vocab_path)
+        loader = DataLoader(train_ds, batch_size=32, shuffle=True)
         
-        if sub_id in aligners:
-            # Get subject-specific noise calculated in previous steps
-            current_noise = sub_noises.get(sub_id)
+        # Initialize model: Contrastive loss uses 'NoScaling' (use_scaling=False)
+        model = SimilarityRefiner(train_ds.vocab_embeddings, use_scaling=(args.loss != "contrastive"))
+        
+        save_name = f"mlp_{args.eeg_encoder}_{args.loss}_{args.epochs}eps.pth"
+        save_path = os.path.join("checkpoints", save_name)
+        
+        run_training(model, loader, args.device, args.epochs, args.loss, save_path)
+        print(f"Training complete. Model saved to {save_path}. Exiting.")
+        return # Training usually stops here before inference
+
+    elif args.mode == "inference":
+        print(f"--- Mode: MLP Inference using {args.checkpoint} ---")
+        if not args.checkpoint or not os.path.exists(args.checkpoint):
+            raise ValueError("Inference mode requires a valid --checkpoint path.")
+
+        vocab_info = torch.load(args.vocab_path)
+        model = SimilarityRefiner(vocab_info["embeddings"])
+        model.load_state_dict(torch.load(args.checkpoint, map_location=args.device))
+        model.to(args.device).eval()
+        
+        latent_dataset = torch.load(clip_latents_path)
+        aligned_results = []
+
+        for item in tqdm(latent_dataset, desc="MLP Mapping"):
+            eeg_vec = item['eeg_clip_latent'].to(args.device).float()
+            if eeg_vec.dim() == 1: eeg_vec = eeg_vec.unsqueeze(0)
+
+            with torch.no_grad():
+                logits, refined_latent = model(eeg_vec)
+                probs = torch.sigmoid(logits).squeeze()
             
-            # Call Aligner with the predicted_object_label anchor
-            bow_with_scores = aligners[sub_id].align(
+            scores, indices = probs.topk(min(args.top_k, len(vocab_info["words"])))
+            bow = [{"word": vocab_info["words"][idx], "score": s.item()} for s, idx in zip(scores, indices)]
+
+            aligned_results.append({
+                "subject": item.get("subject"),
+                "gt_object_label": item.get("object_label", ""),
+                "gt_caption": item.get("caption", ""),
+                "predicted_object_label": item.get("predicted_object_label", "n/a"),
+                "prediction_confidence": item.get("prediction_confidence", 0.0),
+                "bow": bow,
+                "prompt_words": [w['word'] for w in bow],
+                "refined_latent": refined_latent.cpu()
+            })
+        
+        final_alignment_path = os.path.join(args.output_dir, f"{dataset_name}_mlp_{args.loss}_aligned.pt")
+        torch.save(aligned_results, final_alignment_path)
+
+    elif args.mode == "naive":
+        print("--- Mode: Naive Global Alignment ---")
+        global_aligner = Aligner(args.vocab_path, device=args.device)
+        latent_dataset = torch.load(clip_latents_path)
+        aligned_results = []
+
+        for item in tqdm(latent_dataset, desc="Naive Aligning"):
+            bow = global_aligner.align(
                 item['eeg_clip_latent'], 
-                noise=current_noise,
-                predicted_label=pred_obj,
-                confidence=pred_conf,
-                boost_mode=boost_mode,
                 top_k=args.top_k
             )
-            
-            # Construct the detailed result object per your request
             aligned_results.append({
-                "subject": sub_id,
-                "gt_object_label": item.get("object_label", ""),   # Ground Truth
-                "gt_caption": item.get("caption", ""),            # Ground Truth
-                "predicted_object_label": pred_obj,               # Encoder Prediction
-                "prediction_confidence": pred_conf,                 # Confidence Score
-                "bow": bow_with_scores,                           # Boosted Results
-                "prompt_words": [w['word'] for w in bow_with_scores]
+                "subject": item.get("subject"),
+                "gt_object_label": item.get("object_label", ""),
+                "gt_caption": item.get("caption", ""),
+                "predicted_object_label": item.get("predicted_object_label", "n/a"),
+                "prediction_confidence": item.get("prediction_confidence", 0.0),
+                "bow": bow,
+                "prompt_words": [w['word'] for w in bow]
             })
-
-    # Final save to a tensor-compatible format
-    aligned_path = os.path.join(args.output_dir, f"{dataset_name}_boosted_results_with_conf.pt")
-    torch.save(aligned_results, aligned_path)
-    print(f"✅ Step 2 Complete. Aligned results saved to {aligned_path}")
-
-    if not args.skip_llm:
-        print("Step 3: Generating Captions via LLM APIs...")
-        boosted_results_path = "results/imagenet_eeg_test_boosted_results_with_conf.pt"
-        latent_dataset = torch.load(boosted_results_path)
         
+        final_alignment_path = os.path.join(args.output_dir, f"{dataset_name}_naive_aligned.pt")
+        torch.save(aligned_results, final_alignment_path)
 
-        # 3. Proceed with LLM Generation
-        llm_manager = LLMManager(provider="openai", model_name="gpt-4o-mini-2024-07-18")
-        final_output_path = os.path.join(args.output_dir, "all_subjects_feb20_linear_boost.pt")
-
-        # Pass the sampled list directly to the experiment runner
-        final_generations = llm_manager.run_decoding_experiment(
-            input_path=boosted_results_path, # Update your method to accept this
-            output_path=final_output_path
+    # 3. Semantic Decoding via LLM
+    if not args.skip_llm and final_alignment_path:
+        print(f"--- Step 3: LLM Caption Generation ---")
+        llm_manager = LLMManager(provider="openai", model_name="gpt-4o-mini")
+        
+        final_gen_path = final_alignment_path.replace(".pt", "_captions.pt")
+        llm_manager.run_decoding_experiment(
+            input_path=final_alignment_path,
+            output_path=final_gen_path
         )
-        print(f"✅ Pipeline Complete. Samples saved to {final_output_path.replace('.pt', '.csv')}")
-    # 5. Evaluation (To be implemented)
-    if not args.skip_eval:
-        print("Step 4: Running Evaluation Metrics (Coming Soon)...")
+
+    final_csv_path = "results/gemini/mlp_test_llm_gemini_focal_loss_learnt_scaling.csv"
+    # 4. Evaluation
+    if not args.skip_eval and final_csv_path:
+        print(f"--- Step 4: Running Metrics ---")
+        evaluate_and_save_metrics(final_csv_path, output_dir=args.output_dir)
 
 if __name__ == "__main__":
     main()
